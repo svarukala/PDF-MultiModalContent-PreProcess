@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import azure.functions as func
 import azure.durable_functions as df
 from azure.core.credentials import AzureKeyCredential
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import (
     AnalyzeDocumentRequest,
@@ -347,12 +347,6 @@ def assemble_markdown(payload: dict) -> str:
         return f"\n\n---\n\n{description}\n\n---\n\n"
 
     # Replace <figure>![](figures/X)</figure> pattern first (more specific)
-    def replace_figure_tag(match: re.Match) -> str:
-        figure_ref = match.group(1)
-        # Extract figure id from the path
-        figure_id = figure_ref
-        return replacement(figure_id)
-
     figure_tag_pattern = re.compile(
         r"<figure>\s*!\[\]\(figures/([^)]+)\)\s*</figure>"
     )
@@ -395,8 +389,6 @@ def save_to_blob(payload: dict) -> str:
         container_client.create_container()
     except Exception:
         pass  # Container likely already exists
-
-    from azure.storage.blob import ContentSettings
 
     blob_client = container_client.get_blob_client(blob_name)
     blob_client.upload_blob(
