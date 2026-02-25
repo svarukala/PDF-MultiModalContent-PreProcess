@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import azure.functions as func
 import azure.durable_functions as df
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import ResourceExistsError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import (
@@ -23,6 +24,47 @@ from openai import AzureOpenAI
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
+MAX_PDF_SIZE = 200 * 1024 * 1024  # 200 MB
+
+# ---------------------------------------------------------------------------
+# Lazy-initialized singleton clients (reused across activity invocations)
+# ---------------------------------------------------------------------------
+
+_blob_service: BlobServiceClient | None = None
+_di_client: DocumentIntelligenceClient | None = None
+_openai_client: AzureOpenAI | None = None
+
+
+def _get_blob_service() -> BlobServiceClient:
+    global _blob_service
+    if _blob_service is None:
+        _blob_service = BlobServiceClient.from_connection_string(
+            os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+        )
+    return _blob_service
+
+
+def _get_di_client() -> DocumentIntelligenceClient:
+    global _di_client
+    if _di_client is None:
+        _di_client = DocumentIntelligenceClient(
+            endpoint=os.environ["DOCUMENTINTELLIGENCE_ENDPOINT"],
+            credential=AzureKeyCredential(os.environ["DOCUMENTINTELLIGENCE_API_KEY"]),
+        )
+    return _di_client
+
+
+def _get_openai_client() -> AzureOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AzureOpenAI(
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version="2025-04-01-preview",
+        )
+    return _openai_client
+
+
 # ---------------------------------------------------------------------------
 # HTTP Starter — POST /api/pdf
 # ---------------------------------------------------------------------------
@@ -37,22 +79,30 @@ async def http_start(req: func.HttpRequest, client) -> func.HttpResponse:
     if not pdf_bytes:
         return func.HttpResponse("Request body is empty.", status_code=400)
 
-    filename = req.headers.get("X-Filename") or f"{uuid.uuid4()}.pdf"
+    if len(pdf_bytes) > MAX_PDF_SIZE:
+        return func.HttpResponse("PDF exceeds maximum size of 200 MB.", status_code=413)
+
+    if not pdf_bytes[:5].startswith(b"%PDF-"):
+        return func.HttpResponse("Request body is not a valid PDF.", status_code=400)
+
+    # Sanitize filename from header
+    raw_filename = req.headers.get("X-Filename") or f"{uuid.uuid4()}.pdf"
+    filename = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_filename)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     blob_name = f"{timestamp}_{filename}"
 
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
     container_name = os.environ.get("PDF_INPUT_CONTAINER", "pdf-input")
 
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_service = _get_blob_service()
     container_client = blob_service.get_container_client(container_name)
     try:
         container_client.create_container()
-    except Exception:
-        pass  # Container likely already exists
+    except ResourceExistsError:
+        pass
 
     blob_client = container_client.get_blob_client(blob_name)
-    blob_client.upload_blob(pdf_bytes, overwrite=True, content_settings=None)
+    blob_client.upload_blob(pdf_bytes, overwrite=True)
 
     blob_url = blob_client.url
 
@@ -100,7 +150,6 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
     """Orchestrate PDF parsing, figure description, markdown assembly, and save."""
 
     payload = context.get_input()
-    blob_url = payload["blob_url"]
     blob_name = payload["blob_name"]
     original_filename = payload["original_filename"]
     container = payload["container"]
@@ -109,7 +158,6 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
     parse_result = yield context.call_activity(
         "parse_pdf",
         {
-            "blob_url": blob_url,
             "blob_name": blob_name,
             "container": container,
         },
@@ -127,6 +175,8 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
     description_tasks = []
     for figure in figures:
         figure_id = figure["id"]
+        # NOTE: _extract_surrounding_text is a pure function (regex over strings),
+        # which is safe to call inside an orchestrator during replay.
         surrounding_text = _extract_surrounding_text(markdown, figure_id)
         task = context.call_activity_with_retry(
             "describe_figure",
@@ -141,7 +191,10 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
         description_tasks.append(task)
 
     # Step 3: Fan-in — wait for all descriptions
-    descriptions = yield context.task_all(description_tasks)
+    if description_tasks:
+        descriptions = yield context.task_all(description_tasks)
+    else:
+        descriptions = []
 
     # Step 4: Assemble final markdown
     final_markdown = yield context.call_activity(
@@ -162,10 +215,11 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
         },
     )
 
+    # Return metadata only — full markdown is in blob storage (avoids
+    # Durable Functions history size limits on large documents).
     return {
         "status": "completed",
         "blob_url": output_blob_url,
-        "markdown": final_markdown,
         "figures_processed": len(figures),
         "figures_described": len(descriptions),
     }
@@ -183,17 +237,11 @@ def parse_pdf(payload: dict) -> dict:
     container = payload["container"]
     blob_name = payload["blob_name"]
 
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_service = _get_blob_service()
     blob_client = blob_service.get_container_client(container).get_blob_client(blob_name)
     pdf_bytes = blob_client.download_blob().readall()
 
-    endpoint = os.environ["DOCUMENTINTELLIGENCE_ENDPOINT"]
-    api_key = os.environ["DOCUMENTINTELLIGENCE_API_KEY"]
-    di_client = DocumentIntelligenceClient(
-        endpoint=endpoint,
-        credential=AzureKeyCredential(api_key),
-    )
+    di_client = _get_di_client()
 
     poller = di_client.begin_analyze_document(
         model_id="prebuilt-layout",
@@ -222,7 +270,6 @@ def parse_pdf(payload: dict) -> dict:
             base64_png = base64.b64encode(image_bytes).decode("utf-8")
         except Exception as exc:
             logging.warning("Failed to fetch figure '%s': %s", figure_id, exc)
-            base64_png = None
 
         figures.append(
             {
@@ -249,7 +296,7 @@ def parse_pdf(payload: dict) -> dict:
 
 @app.activity_trigger(input_name="payload")
 def describe_figure(payload: dict) -> dict:
-    """Use GPT-4o (or configured model) to describe a single figure image."""
+    """Use the configured Azure OpenAI model to describe a single figure image."""
 
     figure_id = payload["figure_id"]
     base64_png = payload.get("base64_png")
@@ -264,12 +311,7 @@ def describe_figure(payload: dict) -> dict:
         )
         return {"figure_id": figure_id, "description": fallback}
 
-    openai_client = AzureOpenAI(
-        api_key=os.environ["AZURE_OPENAI_API_KEY"],
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version="2025-04-01-preview",
-    )
-
+    openai_client = _get_openai_client()
     deployment_name = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
 
     system_prompt = (
@@ -318,7 +360,11 @@ def describe_figure(payload: dict) -> dict:
         temperature=0.1,
     )
 
-    description_text = response.choices[0].message.content.strip()
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        logging.warning("GPT returned empty content for figure '%s'.", figure_id)
+        raw_content = "[Figure description could not be generated.]"
+    description_text = raw_content.strip()
 
     if caption:
         description_text = f"{caption}\n\n{description_text}"
@@ -380,15 +426,14 @@ def save_to_blob(payload: dict) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     blob_name = f"{name_base}_{timestamp}.md"
 
-    connection_string = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
     output_container = os.environ.get("PDF_OUTPUT_CONTAINER", "pdf-output")
 
-    blob_service = BlobServiceClient.from_connection_string(connection_string)
+    blob_service = _get_blob_service()
     container_client = blob_service.get_container_client(output_container)
     try:
         container_client.create_container()
-    except Exception:
-        pass  # Container likely already exists
+    except ResourceExistsError:
+        pass
 
     blob_client = container_client.get_blob_client(blob_name)
     blob_client.upload_blob(
