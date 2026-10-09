@@ -1,14 +1,16 @@
 import base64
+import json
 import logging
 import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import azure.functions as func
 import azure.durable_functions as df
 from azure.core.credentials import AzureKeyCredential
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import (
@@ -17,6 +19,7 @@ from azure.ai.documentintelligence.models import (
     AnalyzeOutputOption,
 )
 from openai import AzureOpenAI
+from figure_markdown import assemble_figures, surrounding_text
 
 # ---------------------------------------------------------------------------
 # App initialization
@@ -89,8 +92,8 @@ async def http_start(req: func.HttpRequest, client) -> func.HttpResponse:
     raw_filename = req.headers.get("X-Filename") or f"{uuid.uuid4()}.pdf"
     filename = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_filename)
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    blob_name = f"{timestamp}_{filename}"
+    job_id = uuid.uuid4().hex
+    blob_name = f"{job_id}/{filename}"
 
     container_name = os.environ.get("PDF_INPUT_CONTAINER", "pdf-input")
 
@@ -111,33 +114,79 @@ async def http_start(req: func.HttpRequest, client) -> func.HttpResponse:
         "blob_name": blob_name,
         "original_filename": filename,
         "container": container_name,
+        "job_id": job_id,
     }
 
-    instance_id = await client.start_new("pdf_processing_orchestrator", None, orchestrator_input)
+    instance_id = await client.start_new("pdf_processing_orchestrator", job_id, orchestrator_input)
 
     logging.info("Started orchestration with ID='%s' for blob '%s'.", instance_id, blob_name)
 
-    return client.create_check_status_response(req, instance_id)
+    response = client.create_check_status_response(req, instance_id)
+    body = json.loads(response.get_body())
+    body["jobStatusUrl"] = f"/api/jobs/{instance_id}"
+    return func.HttpResponse(json.dumps(body), status_code=202, mimetype="application/json",
+                             headers=dict(response.headers))
 
 
-# ---------------------------------------------------------------------------
-# Helper: _extract_surrounding_text
-# ---------------------------------------------------------------------------
+@app.route(route="viewer", methods=["GET"])
+def viewer(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(
+        Path(__file__).with_name("web").joinpath("index.html").read_text(encoding="utf-8"),
+        mimetype="text/html",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
-def _extract_surrounding_text(markdown: str, figure_id: str, window: int = 500) -> str:
-    """Get ~500 chars before and after a figure reference in the markdown."""
-    patterns = [
-        f"<figure>\\s*!\\[\\]\\(figures/{re.escape(figure_id)}\\)\\s*</figure>",
-        f"!\\[\\]\\(figures/{re.escape(figure_id)}\\)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, markdown)
-        if match:
-            start = max(0, match.start() - window)
-            end = min(len(markdown), match.end() + window)
-            return markdown[start:end]
-    return ""
+def _valid_job_id(job_id: str) -> bool:
+    return re.fullmatch(r"[a-f0-9]{32}", job_id) is not None
+
+
+@app.route(route="jobs/{job_id}", methods=["GET"])
+@app.durable_client_input(client_name="client")
+async def job_status(req: func.HttpRequest, client) -> func.HttpResponse:
+    job_id = req.route_params["job_id"]
+    if not _valid_job_id(job_id):
+        return func.HttpResponse("Invalid job ID.", status_code=400)
+    status = await client.get_status(job_id, show_input=True)
+    if status is None or status.name != "pdf_processing_orchestrator":
+        return func.HttpResponse("Job not found.", status_code=404)
+    state = status.runtime_status.name
+    progress = status.custom_status or {}
+    output = status.output if isinstance(status.output, dict) else {}
+    job_input = status.input_ or {}
+    if isinstance(job_input, str):
+        job_input = json.loads(job_input)
+    has_artifacts = job_input.get("job_id") == job_id
+    body = {
+        "id": job_id, "runtimeStatus": state, "progress": progress,
+        "output": output, "filename": job_input.get("original_filename", ""),
+        "error": str(status.output or "No error detail returned.").splitlines()[0][:2000]
+        if state in ("Failed", "Terminated", "Canceled") else None,
+        "files": {
+            "interim": f"/api/jobs/{job_id}/files/interim" if progress.get("interim_ready") else None,
+            "final": f"/api/jobs/{job_id}/files/final" if has_artifacts and state == "Completed" else None,
+        },
+    }
+    return func.HttpResponse(json.dumps(body), mimetype="application/json",
+                             headers={"Cache-Control": "no-store"})
+
+
+@app.route(route="jobs/{job_id}/files/{kind}", methods=["GET"])
+def job_file(req: func.HttpRequest) -> func.HttpResponse:
+    job_id, kind = req.route_params["job_id"], req.route_params["kind"]
+    if not _valid_job_id(job_id) or kind not in ("interim", "final"):
+        return func.HttpResponse("Invalid artifact path.", status_code=400)
+    blob = _get_blob_service().get_blob_client(
+        os.environ.get("PDF_OUTPUT_CONTAINER", "pdf-output"), f"{job_id}/{kind}.md"
+    )
+    try:
+        markdown = blob.download_blob().readall()
+    except ResourceNotFoundError:
+        return func.HttpResponse("File is not available yet.", status_code=404)
+    return func.HttpResponse(markdown, mimetype="text/plain", charset="utf-8", headers={
+        "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f'inline; filename="{kind}-{job_id}.md"',
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -153,75 +202,96 @@ def pdf_processing_orchestrator(context: df.DurableOrchestrationContext):
     blob_name = payload["blob_name"]
     original_filename = payload["original_filename"]
     container = payload["container"]
+    job_id = payload.get("job_id")
+    progress = {"stage": "parse", "completed": 0, "total": 0, "interim_ready": False, "events": []}
+
+    def report(stage, message):
+        progress["stage"] = stage
+        progress["events"] = (progress["events"] + [{
+            "time": context.current_utc_datetime.isoformat(),
+            "message": message,
+            "sequence": progress.get("sequence", 0) + 1,
+        }])[-12:]
+        progress["sequence"] = progress.get("sequence", 0) + 1
+        context.set_custom_status(dict(progress))
 
     # Step 1: Parse PDF with Document Intelligence
+    report("parse", "parse_pdf -> Blob download; Document Intelligence prebuilt-layout and figure extraction")
     parse_result = yield context.call_activity(
         "parse_pdf",
         {
             "blob_name": blob_name,
             "container": container,
+            "job_id": job_id,
         },
     )
 
     markdown = parse_result["markdown"]
     figures = parse_result.get("figures", [])
+    progress.update(total=len(figures), interim_ready=bool(job_id))
+    report("describe", f"parse_pdf completed: {len(figures)} figures; interim Markdown saved")
 
     # Step 2: Fan-out — describe each figure in parallel
-    retry_options = df.RetryOptions(
-        first_retry_interval_in_milliseconds=5000,
+    figure_retry_options = df.RetryOptions(
+        first_retry_interval_in_milliseconds=60000,
         max_number_of_attempts=3,
     )
 
-    description_tasks = []
-    for figure in figures:
-        figure_id = figure["id"]
-        # NOTE: _extract_surrounding_text is a pure function (regex over strings),
-        # which is safe to call inside an orchestrator during replay.
-        surrounding_text = _extract_surrounding_text(markdown, figure_id)
-        task = context.call_activity_with_retry(
-            "describe_figure",
-            retry_options=retry_options,
-            input_={
-                "figure_id": figure_id,
-                "base64_png": figure.get("base64_png"),
-                "caption": figure.get("caption", ""),
-                "surrounding_text": surrounding_text,
-            },
-        )
-        description_tasks.append(task)
-
-    # Step 3: Fan-in — wait for all descriptions
-    if description_tasks:
-        descriptions = yield context.task_all(description_tasks)
-    else:
-        descriptions = []
+    descriptions = []
+    for offset in range(0, len(figures), 2):
+        batch = figures[offset:offset + 2]
+        report("describe", "describe_figure -> Azure OpenAI: " + ", ".join(f["id"] for f in batch))
+        tasks = [
+            context.call_activity_with_retry(
+                "describe_figure", retry_options=figure_retry_options,
+                input_={
+                    "figure_id": figure["id"], "base64_png": figure.get("base64_png"),
+                    "caption": figure.get("caption", ""),
+                    "surrounding_text": surrounding_text(markdown, figure),
+                },
+            ) for figure in batch
+        ]
+        results = yield context.task_all(tasks)
+        descriptions.extend(results)
+        progress["completed"] = len(descriptions)
+        report("describe", f"describe_figure completed: {len(descriptions)}/{len(figures)}")
 
     # Step 4: Assemble final markdown
+    report("assemble", "assemble_markdown -> replace figure spans with descriptions")
     final_markdown = yield context.call_activity(
         "assemble_markdown",
         {
             "markdown": markdown,
             "descriptions": descriptions,
+            "figures": [{"id": f["id"], "spans": f.get("spans", [])} for f in figures],
         },
     )
 
     # Step 5: Save to output blob
+    report("save", "save_to_blob -> upload final Markdown")
+    storage_retry_options = df.RetryOptions(
+        first_retry_interval_in_milliseconds=5000,
+        max_number_of_attempts=3,
+    )
     output_blob_url = yield context.call_activity_with_retry(
         "save_to_blob",
-        retry_options=retry_options,
+        retry_options=storage_retry_options,
         input_={
             "markdown": final_markdown,
             "original_filename": original_filename,
+            "job_id": job_id,
         },
     )
 
     # Return metadata only — full markdown is in blob storage (avoids
     # Durable Functions history size limits on large documents).
+    report("completed", "Final Markdown saved; ready to view and download")
     return {
         "status": "completed",
         "blob_url": output_blob_url,
         "figures_processed": len(figures),
-        "figures_described": len(descriptions),
+        "figures_described": sum(item.get("status", "described") == "described" for item in descriptions),
+        "figures_with_fallback": sum(item.get("status") == "fallback" for item in descriptions),
     }
 
 
@@ -248,9 +318,14 @@ def parse_pdf(payload: dict) -> dict:
         body=AnalyzeDocumentRequest(bytes_source=pdf_bytes),
         output_content_format=DocumentContentFormat.MARKDOWN,
         output=[AnalyzeOutputOption.FIGURES],
+        string_index_type="unicodeCodePoint",
     )
     result = poller.result()
     operation_id = poller.details["operation_id"]
+    if not isinstance(result.content, str):
+        raise ValueError("Document Intelligence returned no Markdown content.")
+    if payload.get("job_id"):
+        _save_markdown(result.content, f"{payload['job_id']}/interim.md")
 
     figures = []
     for figure in result.figures or []:
@@ -276,6 +351,7 @@ def parse_pdf(payload: dict) -> dict:
                 "id": figure_id,
                 "base64_png": base64_png,
                 "caption": caption_text,
+                "spans": [{"offset": span.offset, "length": span.length} for span in figure.spans or []],
             }
         )
 
@@ -309,7 +385,7 @@ def describe_figure(payload: dict) -> dict:
             if caption
             else "[Figure image could not be retrieved.]"
         )
-        return {"figure_id": figure_id, "description": fallback}
+        return {"figure_id": figure_id, "description": fallback, "status": "fallback"}
 
     openai_client = _get_openai_client()
     deployment_name = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
@@ -361,7 +437,8 @@ def describe_figure(payload: dict) -> dict:
     )
 
     raw_content = response.choices[0].message.content
-    if not raw_content:
+    described = bool(raw_content and raw_content.strip())
+    if not described:
         logging.warning("GPT returned empty content for figure '%s'.", figure_id)
         raw_content = "[Figure description could not be generated.]"
     description_text = raw_content.strip()
@@ -371,7 +448,8 @@ def describe_figure(payload: dict) -> dict:
 
     logging.info("describe_figure: described figure '%s'.", figure_id)
 
-    return {"figure_id": figure_id, "description": description_text}
+    return {"figure_id": figure_id, "description": description_text,
+            "status": "described" if described else "fallback"}
 
 
 # ---------------------------------------------------------------------------
@@ -383,27 +461,8 @@ def describe_figure(payload: dict) -> dict:
 def assemble_markdown(payload: dict) -> str:
     """Replace figure placeholders in markdown with GPT-generated descriptions."""
 
-    markdown = payload["markdown"]
-    descriptions: list = payload.get("descriptions", [])
-
-    desc_map = {item["figure_id"]: item["description"] for item in descriptions}
-
-    def replacement(figure_id: str) -> str:
-        description = desc_map.get(figure_id, "[Figure description unavailable.]")
-        return f"\n\n---\n\n{description}\n\n---\n\n"
-
-    # Replace <figure>![](figures/X)</figure> pattern first (more specific)
-    figure_tag_pattern = re.compile(
-        r"<figure>\s*!\[\]\(figures/([^)]+)\)\s*</figure>"
-    )
-    markdown = figure_tag_pattern.sub(
-        lambda m: replacement(m.group(1)), markdown
-    )
-
-    # Replace bare ![](figures/X) pattern
-    bare_pattern = re.compile(r"!\[\]\(figures/([^)]+)\)")
-    markdown = bare_pattern.sub(lambda m: replacement(m.group(1)), markdown)
-
+    markdown = assemble_figures(payload["markdown"], payload.get("figures", []),
+                                payload.get("descriptions", []))
     logging.info("assemble_markdown: assembled final markdown.")
     return markdown
 
@@ -424,8 +483,12 @@ def save_to_blob(payload: dict) -> str:
     name_base = re.sub(r"\.pdf$", "", original_filename, flags=re.IGNORECASE)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    blob_name = f"{name_base}_{timestamp}.md"
+    blob_name = (f"{payload['job_id']}/final.md" if payload.get("job_id")
+                 else f"{name_base}_{timestamp}.md")
+    return _save_markdown(markdown_content, blob_name)
 
+
+def _save_markdown(markdown_content: str, blob_name: str) -> str:
     output_container = os.environ.get("PDF_OUTPUT_CONTAINER", "pdf-output")
 
     blob_service = _get_blob_service()

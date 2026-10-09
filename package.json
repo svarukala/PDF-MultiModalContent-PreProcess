@@ -1,0 +1,13 @@
+{
+  "name": "pdf-multimodal-local",
+  "private": true,
+  "scripts": {
+    "storage": "azurite --location .azurite --blobHost 127.0.0.1 --queueHost 127.0.0.1 --tableHost 127.0.0.1 --skipApiVersionCheck",
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\start-local.ps1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.0-beta-1791301756000",
+    "azure-functions-core-tools": "4.15.2",
+    "azurite": "3.37.0"
+  }
+}

@@ -72,7 +72,7 @@ The client sends the raw PDF bytes in the request body with an optional `X-Filen
    - Rejects files over 200 MB (413)
    - Checks for `%PDF-` magic bytes to confirm it's actually a PDF (400)
 2. **Sanitizes the filename** — strips any characters that aren't `a-z A-Z 0-9 . _ -` to prevent path traversal or blob naming issues
-3. **Uploads the PDF** to the `pdf-input` blob container with a timestamped name (e.g., `20260226T143000Z_RxInsights_5657563.pdf`)
+3. **Uploads the PDF** to the `pdf-input` blob container under a unique job ID (e.g., `{job_id}/RxInsights_5657563.pdf`), preventing same-name uploads from colliding
 4. **Starts the Durable orchestrator** with the blob reference as input
 5. **Returns a status-check URL** — the client polls this URL to track progress and retrieve results
 
@@ -86,14 +86,17 @@ The client sends the raw PDF bytes in the request body with an optional `X-Filen
 This activity:
 
 1. **Downloads the PDF** from blob storage
-2. **Calls Azure Document Intelligence** using the `prebuilt-layout` model with two critical parameters:
+2. **Calls Azure Document Intelligence** using the `prebuilt-layout` model:
    - `output_content_format=MARKDOWN` — the service converts all text, headings, lists, and tables into well-structured Markdown. Tables are rendered as HTML `<table>` elements (to handle merged cells/multirow headers)
    - `output=[FIGURES]` — the service identifies every chart, graph, photo, and diagram in the PDF and crops each one as a separate PNG image
+   - `string_index_type=unicodeCodePoint` — figure offsets match Python string indices, including documents with emoji and other supplementary Unicode characters
 3. **Fetches each figure image** via `get_analyze_result_figure()`, which returns the cropped PNG bytes. Each figure is base64-encoded for transport through the orchestrator
-4. **Returns** the draft Markdown (with `![](figures/1.1)` placeholders where figures were) plus a list of figures, each containing:
+4. **Saves the exact draft Markdown** to `pdf-output/{job_id}/interim.md`.
+5. **Returns** the draft Markdown (typically containing `<figure>` blocks with OCR text and captions, not image links) plus a list of figures, each containing:
    - `id` — the figure identifier (e.g., `1.1` for page 1, figure 1)
    - `base64_png` — the cropped image as base64 (or `None` if extraction failed)
    - `caption` — any caption text Document Intelligence detected
+   - `spans` — offsets and lengths locating the figure in the original Markdown
 
 **Failure handling:** If a specific figure image can't be fetched (network error, etc.), the figure's `base64_png` is set to `None` and processing continues. The figure will get a fallback placeholder in the final output rather than killing the entire job.
 
@@ -102,7 +105,10 @@ This activity:
 **Input per figure:** Base64 PNG image + surrounding text context (~500 chars before/after the figure in the Markdown) + caption
 **Output per figure:** Markdown description of the visual
 
-For every figure extracted in Step 1, the orchestrator spawns a separate `describe_figure` activity **in parallel**. This is the Durable Functions "fan-out" pattern — if a PDF has 30 charts, all 30 GPT calls run concurrently.
+For every figure extracted in Step 1, the orchestrator schedules a separate
+`describe_figure` activity in **batches of two**, updating progress after each
+batch. `host.json` also limits execution to **2 concurrent activities per host**
+to reduce bursts against the development model's token quota.
 
 Each activity:
 
@@ -115,32 +121,35 @@ Each activity:
 4. **Handles null GPT responses** — if the model returns empty content (content filter, refusal), inserts `[Figure description could not be generated.]`
 5. **Prepends the caption** if Document Intelligence detected one
 
-**Retry policy:** Each `describe_figure` call retries up to 3 times with a 5-second initial backoff. If GPT fails on one chart, it retries without affecting other charts.
+**Retry policy:** Each `describe_figure` activity gets up to 3 attempts with a
+60-second initial backoff, allowing the model's token-rate window to refill after
+throttling. The OpenAI SDK also performs its own transient-error retries. Exhausted
+activity retries fail the orchestration rather than silently omitting a figure.
 
 ### Step 3: Fan-In (`task_all`)
 
-The orchestrator calls `context.task_all(description_tasks)` which **suspends until every parallel `describe_figure` activity completes**. It then collects all descriptions into a single list.
+For each batch, the orchestrator calls `context.task_all(tasks)` and suspends
+until both activities complete. It collects all descriptions into one list
+and reports the completed figure count before starting the next batch.
 
 If there are zero figures in the PDF (text-only document), the fan-out/fan-in is skipped entirely.
 
 ### Step 4: Assemble Final Markdown (`assemble_markdown` activity)
 
-**Input:** Draft Markdown + all figure descriptions
+**Input:** Draft Markdown + figure IDs/spans + all figure descriptions
 **Output:** Final self-contained Markdown string
 
 This activity:
 
-1. **Builds a lookup map** from `figure_id` → `description`
-2. **Runs two regex replacement passes:**
-   - First: replaces `<figure>![](figures/X)</figure>` patterns (the tagged format Document Intelligence uses)
-   - Second: replaces bare `![](figures/X)` patterns (fallback format)
-3. **Each figure placeholder is replaced** with the GPT description wrapped in horizontal rules:
-   ```
-   ---
-   [GPT-generated description of the chart/diagram]
-   ---
-   ```
-4. If a figure has no matching description, inserts `[Figure description unavailable.]`
+1. **Requires exactly one nonempty description per figure.** Missing or duplicate descriptions fail explicitly.
+2. **Uses original character spans** to locate figures, expanding a span to its enclosing `<figure>` block when appropriate. Legacy `![](figures/X)` links are also supported.
+3. **Merges overlapping spans** so multiple images in one figure block retain all their descriptions. Text outside the replaced spans is preserved.
+4. **Inserts each description once**, wrapped in horizontal rules and identified by `<!-- Figure ID -->`.
+5. **Appends figures without text positions** under `Additional figure descriptions` and logs a warning, rather than guessing their locations from list order or dropping them.
+
+The raw interim file remains unchanged. Figure IDs and spans, not the number or
+order of HTML blocks, are the source of truth: a document can have more extracted
+images than `<figure>` blocks.
 
 ### Step 5: Save to Blob (`save_to_blob` activity)
 
@@ -149,8 +158,8 @@ This activity:
 
 This activity:
 
-1. **Strips the `.pdf` extension** from the original filename
-2. **Generates a timestamped blob name** (e.g., `RxInsights_5657563_20260226T143500Z.md`)
+1. **Uses the unique job ID** to keep artifacts from separate uploads isolated
+2. **Names the final artifact** `{job_id}/final.md` (legacy activity inputs without a job ID retain timestamped filenames)
 3. **Uploads to the `pdf-output` container** with `content_type: text/markdown`
 4. **Returns the blob URL** — this is what the client receives when polling the status endpoint
 
@@ -163,9 +172,10 @@ The orchestrator returns metadata only (not the full Markdown — see Design Dec
 ```json
 {
   "status": "completed",
-  "blob_url": "https://storage.blob.core.windows.net/pdf-output/RxInsights_5657563_20260226T143500Z.md",
+  "blob_url": "https://storage.blob.core.windows.net/pdf-output/{job_id}/final.md",
   "figures_processed": 24,
-  "figures_described": 24
+  "figures_described": 24,
+  "figures_with_fallback": 0
 }
 ```
 
@@ -176,6 +186,8 @@ The client retrieves this by polling the status-check URL returned in Step 0.
 ```
 PDF-MultiModal-Analysis/
 ├── function_app.py              # All functions in one file (v2 decorator model)
+├── figure_markdown.py           # Span mapping and lossless description insertion
+├── web/index.html              # Self-contained upload/progress/file viewer
 ├── host.json                    # Durable Functions config + extension bundle
 ├── local.settings.json          # Local dev credentials (gitignored)
 ├── requirements.txt             # Python dependencies
@@ -183,6 +195,7 @@ PDF-MultiModal-Analysis/
 ├── .gitignore
 ├── .funcignore                  # Excludes files from Azure deployment
 ├── test_local.py                # Test script: upload PDF, poll, download result
+├── tests/                       # Python regressions and Playwright browser checks
 └── docs/
     ├── architecture.md          # This file
     └── plans/
@@ -192,7 +205,10 @@ PDF-MultiModal-Analysis/
 
 ### Why a Single File?
 
-The entire app lives in `function_app.py` (~450 lines). Azure Functions Python v2 model uses a `DFApp` instance with decorators — the HTTP starter, orchestrator, and all 4 activities are registered on the same `app` object. For a project of this scope, a single file keeps deployment simple and avoids circular import issues. It can be split into modules later if the project grows.
+Azure Functions Python v2 registers the HTTP routes, orchestrator, and all four
+activities on one `DFApp` in `function_app.py`. Pure figure-mapping logic lives in
+`figure_markdown.py` for focused regression coverage. The viewer is a standalone
+HTML file served by the same host; no frontend build or separate server is needed.
 
 ## Dependencies
 
@@ -229,7 +245,11 @@ Standard Azure Functions have a 10-minute timeout (Consumption plan). A 100+ pag
 
 ### 2. Fan-Out/Fan-In for Figure Description
 
-Each figure is described independently by GPT. By fanning out N parallel activity calls, a PDF with 30 charts processes all 30 concurrently rather than sequentially. This reduces total processing time from `N × ~15 seconds` to roughly `~15 seconds` (bounded by the slowest single GPT call).
+Each figure is described independently by GPT. The orchestrator schedules batches
+of two and reports progress between batches; the host also executes at most two
+activities concurrently. This conservative default suits the development deployment's quota;
+it is not a token-rate limiter. Multiple scaled-out hosts share the Azure OpenAI
+quota, so concurrency and deployment capacity must be reviewed before scaling.
 
 ### 3. Metadata-Only Orchestrator Output
 
@@ -259,19 +279,170 @@ The HTTP starter accepts raw PDF bytes in the request body (`Content-Type: appli
 | Malicious filename in header | Sanitized to alphanumeric + `._-` only |
 | Document Intelligence fails | `parse_pdf` raises, orchestrator fails immediately (fatal — nothing to process) |
 | Single figure image extraction fails | `base64_png` set to `None`, fallback text inserted, other figures unaffected |
-| GPT fails for one figure | Retried 3× with 5s backoff; after exhaustion, orchestrator fails that figure |
+| GPT fails for one figure | Up to 3 activity attempts with 60s initial backoff; after exhaustion, the orchestration fails |
 | GPT returns empty/filtered content | Fallback: `[Figure description could not be generated.]` |
 | Blob container doesn't exist | Auto-created; `ResourceExistsError` caught if it already exists |
 | Blob upload fails | `save_to_blob` retried 3× with 5s backoff |
+| Figure has no text span | Description explicitly appended; warning logged |
+| Invalid spans, missing/duplicate descriptions | Assembly fails instead of reporting incomplete output as success |
 
 ## How to Run Locally
 
-1. Fill in `local.settings.json` with Azure credentials
-2. Create a Python 3.12 virtual environment: `py -3.12 -m venv .venv`
-3. Activate: `.venv\Scripts\activate`
-4. Install dependencies: `pip install -r requirements.txt`
-5. Start the function: `func start`
-6. Test: `python test_local.py`
+The Functions host and storage run locally; **PDF parsing and figure descriptions
+still call Azure Document Intelligence and Azure OpenAI**. There is no offline AI
+emulator. You can start the host and check request validation before configuring
+those services, but valid PDFs require real endpoints and keys.
+
+Prerequisites on Windows: **Python 3.12** (`py -3.12`) and **Node.js 22 or 24 LTS**
+with npm. Run these PowerShell commands from the repository root:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm ci
+Copy-Item local.settings.json.example local.settings.json
+```
+
+Copy the settings template only on first setup; do not overwrite existing
+credentials. `local.settings.json` is gitignored. The Functions host reads it
+automatically; it does **not** load `.env`. The `.env.example` file is a reference
+for environments that explicitly load environment variables.
+
+Start storage in one terminal:
+
+```powershell
+npm run storage
+```
+
+This runs the repository-pinned Azurite emulator on loopback ports **10000**
+(Blob), **10001** (Queue), and **10002** (Table). Its data persists in the
+gitignored `.azurite` directory. Both storage settings in the template use
+`UseDevelopmentStorage=true`; no Azure storage account is needed locally.
+The emulator skips API-version header checks because current Azure SDKs may
+request a newer API version than Azurite advertises. This does not add support
+for new storage features; the app uses standard blob upload/download operations.
+
+In a second terminal, start the Functions host:
+
+```powershell
+npm start
+```
+
+The startup script selects `.venv` and runs the repository-pinned Azure Functions
+Core Tools v4. Leave both terminals running; use **Ctrl+C** in each to stop.
+Use `npm start -- --verbose` for detailed startup diagnostics. The first startup
+downloads the Azure Functions extension bundle and requires internet access.
+The upload endpoint is `http://localhost:7071/api/pdf`. Local Core Tools does not
+enforce function keys by default; do not expose this development host publicly.
+
+### Browser page
+
+Open **http://localhost:7071/api/viewer**. Choose a PDF and click **Process PDF**.
+The page uploads to the same `/api/pdf` endpoint, polls the real Durable job,
+and shows extraction, GPT batches, assembly, and storage milestones. It is an
+activity-level progress view, not a trace of every SDK retry or HTTP request.
+The most recent 12 events are persisted in custom status; the open page retains
+up to 250 events. Refresh restores the job from the `job` URL parameter.
+
+The exact **interim Markdown** appears once parsing finishes. The **final
+Markdown** appears after assembly and storage complete. Each has a download button.
+Previews intentionally show Markdown source as text (including HTML tables and
+figure tags), rather than executing or rendering untrusted document HTML.
+Downloads go to your browser's download location, not automatically to `output`.
+AI fallback descriptions are counted separately from successfully described figures.
+
+| Route | Purpose |
+|-------|---------|
+| `GET /api/viewer` | Upload and comparison page |
+| `POST /api/pdf` | Raw PDF upload; HTTP 202 with Durable management URLs and `jobStatusUrl` |
+| `GET /api/jobs/{job_id}` | Bounded progress summary, counts, error, and artifact URLs |
+| `GET /api/jobs/{job_id}/files/interim` | Original Document Intelligence Markdown as plain text |
+| `GET /api/jobs/{job_id}/files/final` | Assembled Markdown as plain text |
+
+Artifacts use private storage and are streamed through Functions; Azure AI and
+storage credentials are never sent to the page. These routes share the app's
+function-key authorization when deployed. The page has an optional function-key
+field for requests; this is a development diagnostic UI, **not multi-user
+authentication or per-user document authorization**. Before a public deployment,
+add appropriate identity/access controls. Do not share job management URLs or keys.
+
+Existing completed jobs from before the viewer was added have no per-job artifact
+files or UI progress; rerun a PDF to produce them. Stop or drain active
+orchestrations before updating orchestrator code, because Durable replay depends
+on the recorded activity sequence.
+
+### Automated checks
+
+With the local host running:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+npx playwright test
+```
+
+Browser checks use installed Microsoft Edge and mock Azure job responses; they
+do not send documents to Azure or incur model charges. A real PDF run is required
+to exercise the configured Azure services.
+
+A request-validation check that does not call any Azure AI services:
+
+```powershell
+curl.exe -i -X POST http://localhost:7071/api/pdf -H "Content-Type: application/pdf" --data-binary "not a PDF"
+```
+
+Expected response: **HTTP 400**, `Request body is not a valid PDF.`
+
+When the Azure AI resources are ready, fill in the five `DOCUMENTINTELLIGENCE_*`
+and `AZURE_OPENAI_*` values in `local.settings.json`, then restart the Functions
+host. Use the actual vision-capable model deployment name, not just the model
+family; `gpt-4.1` is the template default. Keep keys out of source control.
+
+Submit a PDF:
+
+```powershell
+.\.venv\Scripts\python.exe test_local.py "C:\path\to\document.pdf"
+```
+
+The client reads local settings (existing environment variables take precedence),
+polls for up to one hour, and downloads the Markdown to this repository's `output`
+directory. Use `--output-dir`, `--url`, or `--timeout` to override those defaults.
+Failed requests, failed orchestrations, and polling timeouts exit with a nonzero
+status. No Azure resources are created or deployed by this local setup.
+
+### Configured development Azure resources
+
+The development resources are in subscription
+`dad4fa0b-aa0d-42bc-8ec7-a5e83450c6f0`, tenant
+`67c96cd6-4a95-46ee-ac9b-8ee13ae256c4`, resource group
+`rg-pdf-multimodal-dev`, in **East US 2**.
+
+| Resource | Name | Configuration |
+|----------|------|---------------|
+| Document Intelligence | `di-pdf-multimodal-dad4fa0b` | S0, `prebuilt-layout` |
+| Azure OpenAI | `aoai-pdf-multimodal-dad4fa0b` | S0 |
+| Model deployment | `gpt-4.1` | Version `2025-04-14`, Global Standard, 50,000 TPM allocation |
+| Storage | `stpdfmultidad4fa0b` | Standard LRS, TLS 1.2 minimum, anonymous blob access disabled |
+| Blob containers | `pdf-input`, `pdf-output` | Private |
+
+These are usage-billed development resources, not an Azure-hosted deployment of
+the Functions app. Global Standard model processing is not restricted to East US 2.
+The local host continues to use Azurite; the Azure storage account is available
+for the later deployment.
+
+To populate or refresh local AI credentials without printing keys:
+
+```powershell
+# If authentication is needed:
+az login --tenant 67c96cd6-4a95-46ee-ac9b-8ee13ae256c4 --use-device-code
+
+.\scripts\configure-azure-local.ps1
+```
+
+Sign in as `svarukala@powercattools.onmicrosoft.com`. The script explicitly targets
+the development subscription, preserves storage settings and other local values,
+and only updates the five AI settings. It accepts parameters for a different
+subscription, resource group, account names, or deployment name. Restart
+`npm start` after updating settings. Never commit `local.settings.json`.
 
 ## How to Deploy to Azure
 

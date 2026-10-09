@@ -7,3 +7,16 @@ local.settings.json
 test
 .venv
 docs/
+node_modules/
+.azurite/
+scripts/
+tests/
+package.json
+package-lock.json
+local.settings.json.example
+.env*
+test_local.py
+output/
+test-results/
+playwright-report/
+playwright.config.js

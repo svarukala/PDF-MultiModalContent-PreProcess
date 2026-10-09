@@ -4,3 +4,4 @@ azure-ai-documentintelligence==1.0.2
 openai>=2.24.0
 azure-identity
 azure-storage-blob>=12.20.0
+requests>=2.32.0,<3

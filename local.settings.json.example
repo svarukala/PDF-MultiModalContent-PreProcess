@@ -1,0 +1,15 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "AZURE_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
+    "DOCUMENTINTELLIGENCE_ENDPOINT": "",
+    "DOCUMENTINTELLIGENCE_API_KEY": "",
+    "AZURE_OPENAI_ENDPOINT": "",
+    "AZURE_OPENAI_API_KEY": "",
+    "AZURE_OPENAI_DEPLOYMENT_NAME": "gpt-4.1",
+    "PDF_INPUT_CONTAINER": "pdf-input",
+    "PDF_OUTPUT_CONTAINER": "pdf-output"
+  }
+}

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF to Markdown | Pipeline viewer</title>
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --cp-bg: #f7f4ef;
+      --cp-bg-elevated: #fcfbf8;
+      --cp-surface: #ffffff;
+      --cp-surface-soft: #f5f5f5;
+      --cp-border: #dedede;
+      --cp-border-strong: #919191;
+      --cp-text: #242424;
+      --cp-text-muted: #5c5c5c;
+      --cp-text-soft: #6f6f6f;
+      --cp-accent: #b11f4b;
+      --cp-accent-hover: #9a1a41;
+      --cp-accent-soft: rgba(177, 31, 75, 0.08);
+      --cp-accent-fg: #ffffff;
+      --cp-success: #16a34a;
+      --cp-danger: #dc2626;
+      --cp-warning: #f59e0b;
+      --cp-link: #0078d4;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+      --cp-overlay: rgba(255, 255, 255, 0.8);
+      --cp-panel: rgba(255, 255, 255, 0.86);
+      --cp-panel-strong: rgba(255, 255, 255, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.55);
+      --cp-highlight: rgba(177, 31, 75, 0.12);
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --cp-bg: #3d3b3a;
+      --cp-bg-elevated: #343231;
+      --cp-surface: #292929;
+      --cp-surface-soft: #2e2e2e;
+      --cp-border: #474747;
+      --cp-border-strong: #5f5f5f;
+      --cp-text: #dedede;
+      --cp-text-muted: #919191;
+      --cp-text-soft: #b0b0b0;
+      --cp-accent: #fd8ea1;
+      --cp-accent-hover: #fb7b91;
+      --cp-accent-soft: rgba(253, 142, 161, 0.14);
+      --cp-accent-fg: #1a1a1a;
+      --cp-success: #4ade80;
+      --cp-danger: #f87171;
+      --cp-warning: #fbbf24;
+      --cp-link: #4da6ff;
+      --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+      --cp-overlay: rgba(41, 41, 41, 0.88);
+      --cp-panel: rgba(41, 41, 41, 0.72);
+      --cp-panel-strong: rgba(41, 41, 41, 0.96);
+      --cp-sheen: rgba(255, 255, 255, 0.04);
+      --cp-highlight: rgba(253, 142, 161, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--cp-bg); color: var(--cp-text); font: 15px/1.5 "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif; }
+    main { max-width: 1440px; margin: auto; padding: 36px 28px; }
+    h1 { margin: 0; font-size: 32px; letter-spacing: -1px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    p { margin: 8px 0 16px; }
+    .muted, small { color: var(--cp-text-muted); }
+    .eyebrow { color: var(--cp-accent); font-size: 12px; font-weight: 700; letter-spacing: 2px; }
+    .card { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 16px; padding: 24px; margin-top: 20px; }
+    .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .row.spread { justify-content: space-between; }
+    button, input { font: inherit; border-radius: .625rem; }
+    button { background: var(--cp-accent); color: var(--cp-accent-fg); border: 1px solid var(--cp-accent); padding: 10px 18px; cursor: pointer; font-weight: 600; }
+    button:hover:not(:disabled) { background: var(--cp-accent-hover); }
+    button.secondary { background: var(--cp-surface); color: var(--cp-text); border-color: var(--cp-border); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    input[type=file] { flex: 1; min-width: 240px; border: 1px dashed var(--cp-border-strong); padding: 20px; background: var(--cp-bg-elevated); }
+    input[type=password] { background: var(--cp-surface); color: var(--cp-text); border: 1px solid var(--cp-border); padding: 8px; }
+    :focus-visible { outline: 3px solid var(--cp-accent); outline-offset: 3px; }
+    #status { font-weight: 600; }
+    #error { color: var(--cp-danger); white-space: pre-wrap; overflow-wrap: anywhere; }
+    #summary { color: var(--cp-success); }
+    progress { width: 100%; height: 12px; accent-color: var(--cp-accent); margin: 16px 0; }
+    .steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; padding: 0; list-style: none; }
+    .steps li { border: 1px solid var(--cp-border); background: var(--cp-surface-soft); border-radius: .625rem; padding: 12px; font-size: 13px; }
+    .steps li.active { border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+    .steps li.done { border-color: var(--cp-success); }
+    #calls { background: var(--cp-bg-elevated); border-radius: .625rem; padding: 16px; max-height: 220px; overflow: auto; font: 12px/1.8 Consolas, "Courier New", Courier, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .files { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .files .card { min-width: 0; }
+    pre.document { white-space: pre-wrap; overflow-wrap: anywhere; height: 560px; overflow: auto; background: var(--cp-bg-elevated); border: 1px solid var(--cp-border); border-radius: .625rem; padding: 16px; font: 13px/1.65 Consolas, "Courier New", Courier, monospace; }
+    details { margin-top: 16px; }
+    a { color: var(--cp-link); }
+    [hidden] { display: none !important; }
+    @media (max-width: 800px) { main { padding: 24px 16px; } .files { grid-template-columns: 1fr; } .steps { grid-template-columns: 1fr 1fr; } pre.document { height: 360px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">LOCAL PIPELINE VIEWER</div>
+    <h1>From PDF to readable Markdown</h1>
+    <p class="muted">Upload a document, watch the Durable Functions workflow, and compare the raw extraction with the AI-enriched result.</p>
+  </header>
+  <section class="card" aria-labelledby="upload-title">
+    <h2 id="upload-title">1. Choose your PDF</h2>
+    <form id="upload">
+      <div class="row">
+        <input id="pdf" aria-label="PDF file" type="file" accept=".pdf,application/pdf" required>
+        <button id="run" type="submit">Process PDF</button>
+        <button id="resume" type="button" class="secondary" hidden>Resume monitoring</button>
+      </div>
+      <p class="muted">Maximum 200 MB. Document contents are sent to your configured Azure Document Intelligence and Azure OpenAI services. Usage is billed.</p>
+      <details>
+        <summary>Function authentication (optional for local development)</summary>
+        <label for="key">Function key </label><input id="key" type="password" autocomplete="off">
+        <small>Used only in request headers. Not saved in browser storage.</small>
+      </details>
+    </form>
+    <p id="error" role="alert" hidden></p>
+  </section>
+  <section class="card" aria-labelledby="progress-title">
+    <div class="row spread"><h2 id="progress-title">2. Behind the scenes</h2><span id="status" role="status" aria-live="polite">Ready for a PDF</span></div>
+    <small id="job">No job started</small>
+    <ol class="steps">
+      <li data-stage="upload">01 / Upload to Blob</li>
+      <li data-stage="parse">02 / Document Intelligence</li>
+      <li data-stage="describe">03 / GPT figure descriptions</li>
+      <li data-stage="assemble">04 / Assemble Markdown</li>
+      <li data-stage="save">05 / Save final file</li>
+    </ol>
+    <progress id="progress" max="1" value="0" aria-label="Figure description progress"></progress>
+    <p id="summary" aria-live="polite"></p>
+    <div id="calls" role="log" aria-label="Pipeline activity log">Activity events will appear here.</div>
+    <small>Real orchestration milestones and figure-batch calls, not a wire-level HTTP trace. Retries happen inside activities; this view polls every 2 seconds. Refreshing restores the job and its most recent events.</small>
+  </section>
+  <div class="files">
+    <section class="card">
+      <div class="row spread"><h2>3. Interim extraction</h2><button id="download-interim" class="secondary" disabled>Download .md</button></div>
+      <p class="muted">Exact Document Intelligence Markdown, including figure blocks and captions. Available after parsing.</p>
+      <pre id="interim" class="document" tabindex="0" aria-label="Interim Markdown">Waiting for Document Intelligence...</pre>
+    </section>
+    <section class="card">
+      <div class="row spread"><h2>4. Final Markdown</h2><button id="download-final" class="secondary" disabled>Download .md</button></div>
+      <p class="muted">Figure spans replaced with AI descriptions. Figures without a text position are explicitly appended.</p>
+      <pre id="final" class="document" tabindex="0" aria-label="Final Markdown">Waiting for the completed workflow...</pre>
+    </section>
+  </div>
+  <p class="muted">Files are displayed as Markdown source so document HTML and scripts cannot execute in this page. AI descriptions should be reviewed against the original PDF.</p>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const stages = ["upload", "parse", "describe", "assemble", "save"];
+  let jobId = new URLSearchParams(location.search).get("job");
+  let polling = false, filename = "document.pdf", lastSequence = 0;
+  let documents = {}, lines = [];
+  const validId = value => /^[a-f0-9]{32}$/.test(value || "");
+
+  function log(message) {
+    lines.push(message);
+    lines = lines.slice(-250);
+    $("calls").textContent = lines.join("\n");
+    $("calls").scrollTop = $("calls").scrollHeight;
+  }
+  function showError(error) {
+    $("error").textContent = error.message || String(error);
+    $("error").hidden = false;
+  }
+  function showStage(stage) {
+    const index = stage === "completed" ? stages.length : stages.indexOf(stage);
+    document.querySelectorAll("[data-stage]").forEach((element, i) => {
+      element.classList.toggle("done", i < index);
+      element.classList.toggle("active", i === index);
+    });
+  }
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers);
+    if ($("key").value.trim()) headers.set("x-functions-key", $("key").value.trim());
+    const response = await fetch(path, { ...options, headers, signal: AbortSignal.timeout(options.method === "POST" ? 180000 : 30000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 2000)}`);
+    return response;
+  }
+  async function loadFile(kind, url) {
+    if (!url || documents[kind] !== undefined) return;
+    const text = await (await api(url)).text();
+    documents[kind] = text;
+    $(kind).textContent = text;
+    $(`download-${kind}`).disabled = false;
+    log(`GET ${url} -> ${text.length.toLocaleString()} characters loaded`);
+  }
+  for (const kind of ["interim", "final"]) {
+    $(`download-${kind}`).addEventListener("click", () => {
+      const url = URL.createObjectURL(new Blob([documents[kind]], { type: "text/markdown;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${filename.replace(/\.pdf$/i, "")}_${kind}.md`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  }
+  async function monitor() {
+    if (polling || !validId(jobId)) return;
+    polling = true;
+    $("run").disabled = true;
+    $("resume").hidden = true;
+    $("error").hidden = true;
+    try {
+      while (true) {
+        const state = await (await api(`/api/jobs/${jobId}`)).json();
+        const progress = state.progress || {};
+        filename = state.filename || filename;
+        $("job").textContent = `${filename} | Job ${jobId}`;
+        $("status").textContent = `${state.runtimeStatus} - ${progress.completed || 0}/${progress.total || 0} figures processed`;
+        showStage(progress.stage || "upload");
+        $("progress").max = progress.total || 1;
+        $("progress").value = progress.completed || 0;
+        for (const event of progress.events || []) {
+          if (event.sequence > lastSequence) {
+            log(`${new Date(event.time).toLocaleTimeString()}  ${event.message}`);
+            lastSequence = event.sequence;
+          }
+        }
+        await loadFile("interim", state.files.interim);
+        if (["Failed", "Terminated", "Canceled"].includes(state.runtimeStatus)) {
+          throw new Error(`Workflow ${state.runtimeStatus}: ${state.error || "See the Functions host log."}`);
+        }
+        if (state.runtimeStatus === "Completed") {
+          if (!state.files.interim || !state.files.final) {
+            throw new Error("This older run has no viewer artifacts. Upload the PDF again to create interim and final files.");
+          }
+          await loadFile("final", state.files.final);
+          showStage("completed");
+          $("status").textContent = "Completed";
+          $("summary").textContent = `${state.output.figures_described} figures described; ${state.output.figures_with_fallback || 0} fallback descriptions. Both files are ready.`;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    } catch (error) {
+      showError(error);
+      $("status").textContent = "Monitoring stopped";
+      $("resume").hidden = false;
+      log("Monitoring stopped. Resume to check the existing job; this does not resubmit the PDF.");
+    } finally {
+      polling = false;
+      $("run").disabled = false;
+    }
+  }
+  $("resume").addEventListener("click", monitor);
+  $("upload").addEventListener("submit", async event => {
+    event.preventDefault();
+    if (polling) return;
+    const file = $("pdf").files[0];
+    if (!file) return;
+    $("error").hidden = true;
+    if (file.size > 200 * 1024 * 1024) return showError(new Error("PDF exceeds the 200 MB limit."));
+    if (await file.slice(0, 5).text() !== "%PDF-") return showError(new Error("Choose a valid PDF file (%PDF- header required)."));
+    documents = {}; lines = []; lastSequence = 0; filename = file.name;
+    $("summary").textContent = "";
+    $("progress").value = 0;
+    for (const kind of ["interim", "final"]) {
+      $(kind).textContent = "Waiting for this run...";
+      $(`download-${kind}`).disabled = true;
+    }
+    $("run").disabled = true;
+    $("resume").hidden = true;
+    showStage("upload");
+    $("status").textContent = "Uploading PDF...";
+    log(`POST /api/pdf -> uploading ${file.name} (${file.size.toLocaleString()} bytes)`);
+    try {
+      const result = await (await api("/api/pdf", {
+        method: "POST", body: file,
+        headers: { "Content-Type": "application/pdf", "X-Filename": file.name.replace(/[^\x20-\x7E]/g, "_") },
+      })).json();
+      if (!validId(result.id)) throw new Error("Server returned an invalid job ID.");
+      jobId = result.id;
+      const url = new URL(location.href);
+      url.searchParams.set("job", jobId);
+      history.replaceState(null, "", url);
+      log(`HTTP 202 -> Durable orchestration ${jobId} started`);
+      await monitor();
+    } catch (error) {
+      showError(error);
+      $("status").textContent = "Upload did not complete";
+      log("No successful upload response received. If the connection timed out, check the host before resubmitting.");
+    } finally {
+      $("run").disabled = false;
+    }
+  });
+  if (validId(jobId)) monitor();
+</script>
+</body>
+</html>
